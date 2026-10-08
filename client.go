@@ -39,6 +39,10 @@ type Client struct {
 	cookies  []*http.Cookie
 	username string
 
+	// queuedDelay is how long to wait before the attempt-th retry of a
+	// request answered with 202 Accepted. Tests shorten it.
+	queuedDelay func(attempt int) time.Duration
+
 	lock sync.RWMutex
 }
 
@@ -118,7 +122,8 @@ func NewClient(apiKey string, opts ...Option) *Client {
 		client: &http.Client{
 			Transport: http.DefaultTransport,
 		},
-		limiter: noOpLimiter{},
+		limiter:     noOpLimiter{},
+		queuedDelay: queuedBackoff,
 	}
 
 	for _, opt := range opts {
@@ -171,6 +176,39 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 	c.lock.RUnlock()
 
 	return c.client.Do(req)
+}
+
+// doQueued sends a GET request and, while BGG answers 202 Accepted (the
+// response is queued and still being generated), waits and sends it again
+// until it gets any other answer or the request's context is done. The
+// returned response is never a 202; checking its status is up to the caller.
+// Each attempt sends a fresh clone, so headers and cookies are not added twice.
+func (c *Client) doQueued(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	for attempt := 1; ; attempt++ {
+		resp, err := c.do(req.Clone(ctx))
+		if err != nil {
+			return nil, fmt.Errorf("http call: %w", err)
+		}
+		if resp.StatusCode != http.StatusAccepted {
+			return resp, nil
+		}
+		resp.Body.Close()
+
+		timer := time.NewTimer(c.queuedDelay(attempt))
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// queuedBackoff waits 2s before the first retry and grows by one second more
+// each time (2s, 4s, 7s, 11s, ...), capped at 30s.
+func queuedBackoff(attempt int) time.Duration {
+	return min(time.Duration(1+attempt*(attempt+1)/2)*time.Second, 30*time.Second)
 }
 
 // HTTPStatusError wraps a non-success BGG API response, carrying
