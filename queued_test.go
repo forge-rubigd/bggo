@@ -172,3 +172,45 @@ func TestQueuedBackoff(t *testing.T) {
 		assert.Equal(t, w*time.Second, bggo.QueuedBackoff(i+1), "attempt %d", i+1)
 	}
 }
+
+func TestQueued_GivesUpAfterRetries(t *testing.T) {
+	for _, ep := range queuedEndpoints {
+		t.Run(ep.name, func(t *testing.T) {
+			s := newQueuedServer(t, 1000, http.StatusOK, ep.body)
+			err := ep.call(context.Background(), s.client(t, bggo.WithQueuedRetries(3)))
+
+			var statusErr *bggo.HTTPStatusError
+			require.True(t, errors.As(err, &statusErr), "got %v", err)
+			assert.Equal(t, http.StatusAccepted, statusErr.StatusCode)
+			assert.Equal(t, 4, s.Hits(), "the first attempt and 3 retries")
+		})
+	}
+}
+
+func TestQueued_RetryLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		opts    []bggo.Option
+		queued  int
+		wantErr bool
+		want    int
+	}{
+		{"default gives up after DefaultQueuedRetries", nil, 1000, true, bggo.DefaultQueuedRetries + 1},
+		{"default is enough for a short queue", nil, bggo.DefaultQueuedRetries, false, bggo.DefaultQueuedRetries + 1},
+		{"zero means no retry", []bggo.Option{bggo.WithQueuedRetries(0)}, 1000, true, 1},
+		{"negative retries until ready", []bggo.Option{bggo.WithQueuedRetries(-1)}, 25, false, 26},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newQueuedServer(t, tc.queued, http.StatusOK, `<items totalitems="0"></items>`)
+			_, err := s.client(t, tc.opts...).GetCollection(context.Background(), bggo.GetCollectionRequest{Username: "someone"})
+			if tc.wantErr {
+				var statusErr *bggo.HTTPStatusError
+				require.True(t, errors.As(err, &statusErr), "got %v", err)
+				assert.Equal(t, http.StatusAccepted, statusErr.StatusCode)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.want, s.Hits())
+		})
+	}
+}

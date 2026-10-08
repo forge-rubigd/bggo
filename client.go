@@ -42,6 +42,9 @@ type Client struct {
 	// queuedDelay is how long to wait before the attempt-th retry of a
 	// request answered with 202 Accepted. Tests shorten it.
 	queuedDelay func(attempt int) time.Duration
+	// queuedRetries is how many times a request answered with 202 Accepted
+	// is sent again before giving up.
+	queuedRetries int
 
 	lock sync.RWMutex
 }
@@ -106,6 +109,21 @@ func (c *Client) Username() string {
 	return c.username
 }
 
+// DefaultQueuedRetries is how many times a request answered with 202
+// Accepted is retried unless WithQueuedRetries says otherwise. With the
+// default backoff the retries wait about three minutes in total.
+const DefaultQueuedRetries = 10
+
+// WithQueuedRetries sets how many times a GET request answered with 202
+// Accepted (the response is queued and still being generated) is sent again
+// before the method gives up with an *HTTPStatusError carrying 202. Zero
+// means no retry. A negative value keeps retrying until the context is done.
+func WithQueuedRetries(n int) Option {
+	return func(c *Client) {
+		c.queuedRetries = n
+	}
+}
+
 // WithLimiter sets a rate limiter to throttle API calls.
 func WithLimiter(limiter Limiter) Option {
 	return func(c *Client) {
@@ -122,8 +140,9 @@ func NewClient(apiKey string, opts ...Option) *Client {
 		client: &http.Client{
 			Transport: http.DefaultTransport,
 		},
-		limiter:     noOpLimiter{},
-		queuedDelay: queuedBackoff,
+		limiter:       noOpLimiter{},
+		queuedDelay:   queuedBackoff,
+		queuedRetries: DefaultQueuedRetries,
 	}
 
 	for _, opt := range opts {
@@ -179,9 +198,10 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 }
 
 // doQueued sends a GET request and, while BGG answers 202 Accepted (the
-// response is queued and still being generated), waits and sends it again
-// until it gets any other answer or the request's context is done. The
-// returned response is never a 202; checking its status is up to the caller.
+// response is queued and still being generated), waits and sends it again,
+// up to the client's queuedRetries times or until the request's context is
+// done. Running out of retries returns an *HTTPStatusError with the 202; any
+// other response is returned with checking its status left to the caller.
 // Each attempt sends a fresh clone, so headers and cookies are not added twice.
 func (c *Client) doQueued(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
@@ -194,6 +214,9 @@ func (c *Client) doQueued(req *http.Request) (*http.Response, error) {
 			return resp, nil
 		}
 		resp.Body.Close()
+		if c.queuedRetries >= 0 && attempt > c.queuedRetries {
+			return nil, newHTTPStatusError(resp)
+		}
 
 		timer := time.NewTimer(c.queuedDelay(attempt))
 		select {
